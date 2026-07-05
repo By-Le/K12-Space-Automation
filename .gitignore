@@ -1,0 +1,25 @@
+node_modules/
+dist/
+
+# Runtime state and generated output
+data/
+json/
+pool_tokens.txt
+auth/
+k12-basic-auth*
+
+# Local configuration and secrets
+config.json
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Logs and local backups
+*.log
+*.bak.*
+**/._*
