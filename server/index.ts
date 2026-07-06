@@ -1763,68 +1763,62 @@ async function fetchExternalPoolMessages(email: string, queryEmail?: string): Pr
   } catch {
     // ignore
   }
-  if (!parsed.success || !Array.isArray(parsed.data)) {
+  if (!parsed.success) {
     throw new Error(`获取邮件列表失败: ${String(parsed.message || text)}`);
   }
-  return parsed.data as Record<string, unknown>[];
+  const data = parsed.data;
+  // API 可能返回单条对象或数组，统一成数组
+  const list: Record<string, unknown>[] = [];
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (item && typeof item === "object") list.push(item as Record<string, unknown>);
+    }
+  } else if (data && typeof data === "object") {
+    list.push(data as Record<string, unknown>);
+  }
+  if (!list.length) {
+    throw new Error(`${lookup} 的收件箱为空或返回格式异常: ${text.slice(0, 200)}`);
+  }
+  return list;
 }
 
 async function fetchExternalPoolVerificationCode(email: string, queryEmail?: string): Promise<string> {
   const lookup = queryEmail || email;
 
-  // 1) 先走服务端 structured 接口
-  const base = appConfig.externalEmailApiBaseUrl.trim();
-  const apiKey = appConfig.externalEmailApiKey.trim();
-  if (base && apiKey) {
-    const url = new URL(base.replace(/\/+$/, "") + "/api/external/verification-code");
-    url.searchParams.set("email", lookup);
-    url.searchParams.set("code_length", "6");
-    try {
-      const response = await fetch(url.toString(), {headers: {"x-api-key": apiKey}});
-      const text = await response.text();
-      let parsed: Record<string, unknown> = {success: false};
-      try { parsed = JSON.parse(text); } catch { /* ignore */ }
-      if (parsed.success && parsed.data) {
-        const data = parsed.data as Record<string, unknown>;
-        const code = String(data.code || data.verification_code || "");
-        if (code) return code;
-      }
-    } catch {
-      // structured 接口失败，fallback 到 messages
-    }
-  }
-
-  // 2) fallback: 从 messages/latest 获取邮件正文后用本地正则提取验证码
-  appendLog({logs: []} as unknown as K12Task, "warn", `verification-code 接口未命中，改用 messages/latest 提取验证码`);
+  // 直接走 messages/latest + 本地正则提取，避免 verification-code 接口匹配不上 OpenAI 邮件
+  appendLog({logs: []} as unknown as K12Task, "info", `从 ${lookup} 收件箱读取验证码`);
   const messages = await fetchExternalPoolMessages(email, queryEmail);
   if (!messages.length) {
-    throw new Error(`${email} 的收件箱为空`);
+    throw new Error(`${lookup} 的收件箱为空`);
   }
 
   const subjectKeywords = /openai|chatgpt|verification|验证/i;
   for (const msg of messages) {
     const subject = String(msg.subject || msg.title || "");
-    const content = String(msg.content || msg.body || msg.text || msg.html || "");
+    // content_preview / content / body / text / html 都可能携带正文
+    const content = String(
+      msg.content_preview || msg.content || msg.body || msg.text || msg.html || msg.snippet || "",
+    );
 
-    // 优先看标题里带验证相关关键词的邮件
     if (!subject.match(subjectKeywords)) continue;
 
     const code = extractVerificationCodeFromText(content);
     if (code) return code;
   }
 
-  // 没匹配到标题，遍历所有邮件用内容提取
   for (const msg of messages) {
-    const content = String(msg.content || msg.body || msg.text || msg.html || "");
+    const content = String(
+      msg.content_preview || msg.content || msg.body || msg.text || msg.html || msg.snippet || "",
+    );
     const code = extractVerificationCodeFromText(content);
     if (code) return code;
   }
 
   const debugPreview = messages.slice(0, 3).map((m) => ({
     subject: String(m.subject || m.title || ""),
-    snippet: String((m.content || m.body || m.text || m.html || "")).slice(0, 200),
+    snippet: String((m.content_preview || m.content || m.body || m.text || m.html || "")).slice(0, 200),
   }));
-  throw new Error(`${email} 未在最新邮件中提取到验证码，邮件列表: ${JSON.stringify(debugPreview)}`);
+  throw new Error(`${lookup} 未在最新邮件中提取到验证码，邮件列表: ${JSON.stringify(debugPreview)}`);
 }
 
 async function waitForExternalPoolCode(
@@ -1880,17 +1874,16 @@ async function finalizeExternalPoolAccount(email: EmailRecord, task: K12Task): P
 
 function createExternalPoolFissionChild(mother: EmailRecord, index: number): EmailRecord {
   const existing = new Set(emails.map((item) => item.email.toLowerCase()));
-  const prefix = appConfig.externalEmailAliasPrefix || "k12";
-  const timestamp = Date.now().toString(36);
-  const aliasSuffix = `+${prefix}-${timestamp}-${index}`;
   const [localPart, domain] = mother.email.split("@");
+  const randomSuffix = randomUUID().slice(0, 4).toLowerCase();
+  const aliasSuffix = `+${randomSuffix}${index ? `-${index}` : ""}`;
   const childAddress = `${localPart}${aliasSuffix}@${domain}`;
 
   let uniqueAddress = childAddress;
   let counter = 0;
   while (existing.has(uniqueAddress.toLowerCase()) && counter < 50) {
     counter += 1;
-    uniqueAddress = `${localPart}+${prefix}-${timestamp}-${index}-${counter}@${domain}`;
+    uniqueAddress = `${localPart}+${randomSuffix}${index ? `-${index}` : `-${counter}`}@${domain}`;
   }
 
   const record: EmailRecord = {
@@ -6898,8 +6891,8 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
   let selectedEmails = requestedEmailIds.length
     ? emails.filter((item) => requested.has(item.id))
     : emails.filter((item) => item.status === "free");
-  const defaultLimit = dynamicGmailMode || externalPoolMode ? 1 : selectedEmails.length || 1;
-  const limit = asNumber(body.count, defaultLimit, 1, 500);
+  let defaultLimit = selectedEmails.length || 1;
+  let limit = defaultLimit;
   if (externalPoolMode) {
     const poolProvider = asString(body.externalPoolProvider, "outlook") || "outlook";
     const callerId = "k12-automation";
@@ -6908,7 +6901,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
     const claimed: EmailRecord[] = [];
 
     // Claim mother account(s)
-    const motherCount = fissionEnabled ? Math.min(limit, 1) : limit;
+    const motherCount = fissionEnabled ? Math.min(Number(body.count) || 1, 1) : 1;
     for (let i = 0; i < motherCount; i += 1) {
       try {
         const {accountId, email: poolEmail, claimToken, emailDomain} = await claimExternalPoolAccount(
@@ -6934,7 +6927,6 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
           externalPoolFissionChildrenRemaining: fissionEnabled ? fissionCount : 0,
         };
         emails.push(mother);
-        claimed.push(mother);
 
         // Create fission children (all registration uses child accounts)
         if (fissionEnabled) {
@@ -6949,10 +6941,16 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
       }
     }
     selectedEmails = claimed;
+    // 裂变模式下，limit 直接等于实际创建的子号数量，不再受 body.count 限制
+    limit = fissionEnabled ? claimed.length : 1;
   } else if (dynamicGmailMode) {
+    limit = asNumber(body.count, 1, 1, 500);
     selectedEmails = appConfig.gmailMailProvider === "emailnator"
       ? await createEmailnatorMailRecords(limit)
       : await createSmsBowerMailRecords(limit);
+    defaultLimit = 1;
+  } else {
+    limit = asNumber(body.count, defaultLimit, 1, 500);
   }
   const workspaceCandidates = uniqueStringList(parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds);
   const route = body.route === "accept" ? "accept" : appConfig.route;
