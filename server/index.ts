@@ -1742,34 +1742,89 @@ async function releaseExternalPoolAccount(
   }
 }
 
-async function fetchExternalPoolVerificationCode(email: string, queryEmail?: string): Promise<string> {
+async function fetchExternalPoolMessages(email: string, queryEmail?: string): Promise<Record<string, unknown>[]> {
   const base = appConfig.externalEmailApiBaseUrl.trim();
   if (!base) throw new Error("externalEmailApiBaseUrl 未配置");
   const apiKey = appConfig.externalEmailApiKey.trim();
   if (!apiKey) throw new Error("externalEmailApiKey 未配置");
 
   const lookup = queryEmail || email;
-  const url = new URL(base.replace(/\/+$/, "") + "/api/external/verification-code");
+  const url = new URL(base.replace(/\/+$/, "") + "/api/external/messages/latest");
   url.searchParams.set("email", lookup);
-  url.searchParams.set("code_length", "6");
+  url.searchParams.set("limit", "5");
 
   const response = await fetch(url.toString(), {
     headers: {"x-api-key": apiKey},
   });
   const text = await response.text();
-  let parsed: Record<string, unknown> = {success: false};
+  let parsed: Record<string, unknown> = {};
   try {
     parsed = JSON.parse(text);
   } catch {
     // ignore
   }
-  if (!parsed.success || !parsed.data) {
-    throw new Error(`验证码获取失败: ${String(parsed.message || text)}`);
+  if (!parsed.success || !Array.isArray(parsed.data)) {
+    throw new Error(`获取邮件列表失败: ${String(parsed.message || text)}`);
   }
-  const data = parsed.data as Record<string, unknown>;
-  const code = String(data.code || data.verification_code || "");
-  if (!code) throw new Error(`验证码为空: ${JSON.stringify(data)}`);
-  return code;
+  return parsed.data as Record<string, unknown>[];
+}
+
+async function fetchExternalPoolVerificationCode(email: string, queryEmail?: string): Promise<string> {
+  const lookup = queryEmail || email;
+
+  // 1) 先走服务端 structured 接口
+  const base = appConfig.externalEmailApiBaseUrl.trim();
+  const apiKey = appConfig.externalEmailApiKey.trim();
+  if (base && apiKey) {
+    const url = new URL(base.replace(/\/+$/, "") + "/api/external/verification-code");
+    url.searchParams.set("email", lookup);
+    url.searchParams.set("code_length", "6");
+    try {
+      const response = await fetch(url.toString(), {headers: {"x-api-key": apiKey}});
+      const text = await response.text();
+      let parsed: Record<string, unknown> = {success: false};
+      try { parsed = JSON.parse(text); } catch { /* ignore */ }
+      if (parsed.success && parsed.data) {
+        const data = parsed.data as Record<string, unknown>;
+        const code = String(data.code || data.verification_code || "");
+        if (code) return code;
+      }
+    } catch {
+      // structured 接口失败，fallback 到 messages
+    }
+  }
+
+  // 2) fallback: 从 messages/latest 获取邮件正文后用本地正则提取验证码
+  appendLog({logs: []} as unknown as K12Task, "warn", `verification-code 接口未命中，改用 messages/latest 提取验证码`);
+  const messages = await fetchExternalPoolMessages(email, queryEmail);
+  if (!messages.length) {
+    throw new Error(`${email} 的收件箱为空`);
+  }
+
+  const subjectKeywords = /openai|chatgpt|verification|验证/i;
+  for (const msg of messages) {
+    const subject = String(msg.subject || msg.title || "");
+    const content = String(msg.content || msg.body || msg.text || msg.html || "");
+
+    // 优先看标题里带验证相关关键词的邮件
+    if (!subject.match(subjectKeywords)) continue;
+
+    const code = extractVerificationCodeFromText(content);
+    if (code) return code;
+  }
+
+  // 没匹配到标题，遍历所有邮件用内容提取
+  for (const msg of messages) {
+    const content = String(msg.content || msg.body || msg.text || msg.html || "");
+    const code = extractVerificationCodeFromText(content);
+    if (code) return code;
+  }
+
+  const debugPreview = messages.slice(0, 3).map((m) => ({
+    subject: String(m.subject || m.title || ""),
+    snippet: String((m.content || m.body || m.text || m.html || "")).slice(0, 200),
+  }));
+  throw new Error(`${email} 未在最新邮件中提取到验证码，邮件列表: ${JSON.stringify(debugPreview)}`);
 }
 
 async function waitForExternalPoolCode(
