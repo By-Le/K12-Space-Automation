@@ -543,6 +543,12 @@ git ls-files | rg '(^|/)(data|json|auth|pool_tokens|config\.json|k12-basic-auth|
 
 `npm run build` and `npx tsc` should pass. The sensitive-file check should produce no output.
 
+## Thanks
+
+[LINUX DO](https://linux.do) — Community Support
+
+[lxh77721/k12-reg](https://github.com/lxh77721/k12-reg) — Fork origin
+
 ## License
 
 This project is licensed under the MIT License. See `LICENSE`.
