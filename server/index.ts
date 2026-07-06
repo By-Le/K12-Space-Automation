@@ -1742,15 +1742,14 @@ async function releaseExternalPoolAccount(
   }
 }
 
-async function fetchExternalPoolMessages(email: string, queryEmail?: string): Promise<Record<string, unknown>[]> {
+async function fetchExternalPoolMessages(email: string): Promise<Record<string, unknown>[]> {
   const base = appConfig.externalEmailApiBaseUrl.trim();
   if (!base) throw new Error("externalEmailApiBaseUrl 未配置");
   const apiKey = appConfig.externalEmailApiKey.trim();
   if (!apiKey) throw new Error("externalEmailApiKey 未配置");
 
-  const lookup = queryEmail || email;
   const url = new URL(base.replace(/\/+$/, "") + "/api/external/messages/latest");
-  url.searchParams.set("email", lookup);
+  url.searchParams.set("email", email);
   url.searchParams.set("limit", "5");
 
   const response = await fetch(url.toString(), {
@@ -1769,15 +1768,13 @@ async function fetchExternalPoolMessages(email: string, queryEmail?: string): Pr
   return parsed.data as Record<string, unknown>[];
 }
 
-async function fetchExternalPoolVerificationCode(email: string, queryEmail?: string): Promise<string> {
-  const lookup = queryEmail || email;
-
+async function fetchExternalPoolVerificationCode(email: string): Promise<string> {
   // 1) 先走服务端 structured 接口
   const base = appConfig.externalEmailApiBaseUrl.trim();
   const apiKey = appConfig.externalEmailApiKey.trim();
   if (base && apiKey) {
     const url = new URL(base.replace(/\/+$/, "") + "/api/external/verification-code");
-    url.searchParams.set("email", lookup);
+    url.searchParams.set("email", email);
     url.searchParams.set("code_length", "6");
     try {
       const response = await fetch(url.toString(), {headers: {"x-api-key": apiKey}});
@@ -1796,7 +1793,7 @@ async function fetchExternalPoolVerificationCode(email: string, queryEmail?: str
 
   // 2) fallback: 从 messages/latest 获取邮件正文后用本地正则提取验证码
   appendLog({logs: []} as unknown as K12Task, "warn", `verification-code 接口未命中，改用 messages/latest 提取验证码`);
-  const messages = await fetchExternalPoolMessages(email, queryEmail);
+  const messages = await fetchExternalPoolMessages(email);
   if (!messages.length) {
     throw new Error(`${email} 的收件箱为空`);
   }
@@ -1835,14 +1832,13 @@ async function waitForExternalPoolCode(
   const usedCodes = new Set<string>();
   const maxAttempts = 40;
   const intervalMs = 5000;
-  const queryEmail = email.parentEmail || email.email;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     if (task.cancelRequested) {
       throw new Error("任务已取消");
     }
     try {
-      const code = await fetchExternalPoolVerificationCode(email.email, queryEmail);
+      const code = await fetchExternalPoolVerificationCode(email.email);
       if (!usedCodes.has(code)) {
         appendLog(task, "ok", `外部池 ${label} 验证码已获取: ${maskOtpCode(code)}`);
         return code;
@@ -1861,7 +1857,8 @@ async function finalizeExternalPoolAccount(email: EmailRecord, task: K12Task): P
   if (
     email.otpMode !== "external-pool" ||
     email.externalPoolAccountId == null ||
-    !email.externalPoolClaimToken
+    !email.externalPoolClaimToken ||
+    email.parentEmail // 子号共用母号账号，不回写
   ) {
     return;
   }
@@ -6935,7 +6932,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
         emails.push(mother);
         claimed.push(mother);
 
-        // Create fission children
+        // Create fission children (all registration uses child accounts)
         if (fissionEnabled) {
           for (let c = 0; c < fissionCount; c += 1) {
             const child = createExternalPoolFissionChild(mother, c);
@@ -6944,7 +6941,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
         }
       } catch (error) {
         appendLog({logs: []} as unknown as K12Task, "warn", `外部池领号失败 (${i + 1}/${motherCount}): ${error instanceof Error ? error.message : String(error)}`);
-        if (i === 0) throw new Error("外部邮箱池领号失败，无可用账号");
+        if (i === 0 && claimed.length === 0) throw new Error("外部邮箱池领号失败，无可用账号");
       }
     }
     selectedEmails = claimed;
