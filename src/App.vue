@@ -454,6 +454,63 @@
                 </label>
               </div>
             </section>
+
+            <section class="settings-section">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="eyebrow">External Pool</p>
+                  <h3>外部邮箱池（outlookEmailPlus）</h3>
+                </div>
+                <span class="pill">{{ form.externalEmailEnabled ? "已启用" : "未启用" }}</span>
+              </div>
+              <label class="switch-card refill-switch">
+                <input v-model="form.externalEmailEnabled" type="checkbox" />
+                <span>
+                  <strong>使用外部邮箱池</strong>
+                  <small>开启后，未指定邮箱启动任务时从 outlookEmailPlus 池中自动领号；关闭时仍按原来的邮箱池流程执行。</small>
+                </span>
+              </label>
+              <div v-if="form.externalEmailEnabled" class="config-grid refill-config-grid">
+                <label class="field">
+                  <span>服务地址</span>
+                  <input v-model="form.externalEmailApiBaseUrl" placeholder="https://email.retool2.com" />
+                </label>
+                <label class="field">
+                  <span class="field-title-row">
+                    API Key
+                    <em :class="['key-state', externalApiKeySaved ? 'set' : 'unset']">
+                      {{ externalApiKeySaved ? "已设置 Key" : "未设置 Key" }}
+                    </em>
+                  </span>
+                  <input v-model="form.externalEmailApiKey" type="password" :placeholder="externalApiKeyPlaceholder" />
+                  <small v-if="externalApiKeySaved">已保存的 Key：{{ externalApiKeyMasked || "已隐藏" }}，留空保存不会覆盖。</small>
+                  <small v-else>还没有保存 Key，填写后点击"保存配置"才会生效。</small>
+                </label>
+                <label class="switch-card refill-switch">
+                  <input v-model="form.externalEmailAliasEnabled" type="checkbox" />
+                  <span>
+                    <strong>启用别名邮箱</strong>
+                    <small>领号后自动添加 + 后缀（如 user+k12-xxx@domain.com），降低验证码串号风险。</small>
+                  </span>
+                </label>
+                <label class="field" v-if="form.externalEmailAliasEnabled">
+                  <span>别名前缀</span>
+                  <input v-model="form.externalEmailAliasPrefix" placeholder="k12" />
+                  <small>生成的别名格式：user+{前缀}-{时间戳}-{序号}@domain.com</small>
+                </label>
+                <label class="switch-card refill-switch">
+                  <input v-model="form.externalEmailFissionEnabled" type="checkbox" />
+                  <span>
+                    <strong>开启外部池裂变</strong>
+                    <small>母邮箱成功后，自动创建子别名邮箱任务。子任务共用母号读取验证码。</small>
+                  </span>
+                </label>
+                <label class="field" v-if="form.externalEmailFissionEnabled">
+                  <span>每个母号裂变子任务数</span>
+                  <input v-model.number="form.externalEmailFissionCount" type="number" min="1" max="50" />
+                </label>
+              </div>
+            </section>
           </div>
 
           <div class="modal-footer">
@@ -991,6 +1048,8 @@ const startingSub2apiRefill = ref(false);
 const smsBowerApiKeySaved = ref(false);
 const smsBowerApiKeyMasked = ref("");
 const smsBowerBackendUnsupported = ref(false);
+const externalApiKeySaved = ref(false);
+const externalApiKeyMasked = ref("");
 const smsBowerAccount = reactive<SmsBowerAccountStatus>({
   enabled: false,
   apiKeyPresent: false,
@@ -1046,6 +1105,13 @@ const form = reactive({
   smsBowerGmailFissionCount: 1,
   emailnatorBaseUrl: "https://www.emailnator.com",
   emailnatorEmailType: "plusGmail",
+  externalEmailEnabled: false,
+  externalEmailApiBaseUrl: "",
+  externalEmailApiKey: "",
+  externalEmailAliasEnabled: false,
+  externalEmailAliasPrefix: "k12",
+  externalEmailFissionEnabled: false,
+  externalEmailFissionCount: 5,
   tokenOut: "",
   jsonOutDir: "",
   jsonOutFormat: "sub2api",
@@ -1056,9 +1122,10 @@ const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
 const launchTaskCount = computed(() => {
   const count = Math.max(1, Number(runCount.value) || 1);
-  return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter((item) => item.status === "free").length);
+  if (form.smsBowerMailEnabled || form.externalEmailEnabled) return count;
+  return Math.min(count, emails.value.filter((item) => item.status === "free").length);
 });
-const startTasksDisabled = computed(() => busy.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
+const startTasksDisabled = computed(() => busy.value || (!form.smsBowerMailEnabled && !form.externalEmailEnabled && launchTaskCount.value <= 0));
 const selectedRunnableEmailIds = computed(() => emails.value
   .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
   .map((item) => item.id));
@@ -1085,6 +1152,7 @@ const pagedTasks = computed(() => sortedTasks.value.slice(taskPageStart.value, t
 const selectableParentEmails = computed(() => emails.value.filter((item) => !item.parentEmail && item.status !== "running"));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
 const smsBowerApiKeyPlaceholder = computed(() => form.smsBowerApiKey || smsBowerApiKeySaved.value ? "已设置 Key，留空则不修改" : "填写 SMSBower API Key");
+const externalApiKeyPlaceholder = computed(() => form.externalEmailApiKey || externalApiKeySaved.value ? "已设置 Key，留空则不修改" : "填写 outlookEmailPlus API Key");
 const smsBowerBalanceText = computed(() => {
   if (!form.smsBowerMailEnabled) return "未启用";
   if (form.gmailMailProvider === "emailnator") return "Emailnator";
@@ -1223,12 +1291,21 @@ async function loadConfig() {
     smsBowerGmailFissionCount: config.smsBowerGmailFissionCount ?? 1,
     emailnatorBaseUrl: config.emailnatorBaseUrl || "https://www.emailnator.com",
     emailnatorEmailType: config.emailnatorEmailType || "plusGmail",
+    externalEmailEnabled: config.externalEmailEnabled === true,
+    externalEmailApiBaseUrl: config.externalEmailApiBaseUrl || "",
+    externalEmailApiKey: "",
+    externalEmailAliasEnabled: config.externalEmailAliasEnabled === true,
+    externalEmailAliasPrefix: config.externalEmailAliasPrefix || "k12",
+    externalEmailFissionEnabled: config.externalEmailFissionEnabled === true,
+    externalEmailFissionCount: config.externalEmailFissionCount ?? 5,
     tokenOut: config.tokenOut || "",
     jsonOutDir: config.jsonOutDir || "",
     jsonOutFormat: config.jsonOutFormat === "cpa" ? "cpa" : "sub2api",
   });
   smsBowerApiKeySaved.value = Boolean(config.smsBowerApiKeyPresent);
   smsBowerApiKeyMasked.value = config.smsBowerApiKeyMasked || "";
+  externalApiKeySaved.value = Boolean(config.externalEmailApiKeyPresent);
+  externalApiKeyMasked.value = config.externalEmailApiKeyMasked || "";
   workspaceText.value = (config.workspaceIds || []).join("\n");
 }
 

@@ -11,7 +11,7 @@ type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
 type LogLevel = "info" | "ok" | "warn" | "error";
 type TaskKind = "k12" | "at-repair";
 type JsonOutFormat = "sub2api" | "cpa";
-type EmailOtpMode = "auto" | "manual" | "smsbower-mail" | "emailnator";
+type EmailOtpMode = "auto" | "manual" | "smsbower-mail" | "emailnator" | "external-pool";
 type GmailMailProvider = "smsbower" | "emailnator";
 
 interface AppConfig {
@@ -55,6 +55,13 @@ interface AppConfig {
   emailnatorBaseUrl: string;
   emailnatorEmailType: string;
   requireChatgptAccountId: boolean;
+  externalEmailApiBaseUrl: string;
+  externalEmailApiKey: string;
+  externalEmailEnabled: boolean;
+  externalEmailAliasEnabled: boolean;
+  externalEmailAliasPrefix: string;
+  externalEmailFissionEnabled: boolean;
+  externalEmailFissionCount: number;
   tokenOut: string;
   jsonOutDir: string;
   jsonOutFormat: JsonOutFormat;
@@ -99,6 +106,13 @@ interface EmailRecord {
   emailnatorUsedCodes?: string[];
   emailnatorUsedMessageIds?: string[];
   emailnatorBaselineMessageIds?: string[];
+  externalPoolAccountId?: number;
+  externalPoolClaimToken?: string;
+  externalPoolCallerId?: string;
+  externalPoolTaskId?: string;
+  externalPoolProvider?: string;
+  externalPoolFissionChildrenRemaining?: number;
+  externalPoolFissionParentEmailId?: string;
 }
 
 interface SmsBowerAccountSnapshot {
@@ -581,6 +595,13 @@ async function defaultConfig(): Promise<AppConfig> {
     emailnatorBaseUrl: DEFAULT_EMAILNATOR_BASE_URL,
     emailnatorEmailType: "plusGmail",
     requireChatgptAccountId: true,
+    externalEmailApiBaseUrl: "",
+    externalEmailApiKey: "",
+    externalEmailEnabled: false,
+    externalEmailAliasEnabled: false,
+    externalEmailAliasPrefix: "k12",
+    externalEmailFissionEnabled: false,
+    externalEmailFissionCount: 5,
     tokenOut,
     jsonOutDir: defaultJsonOutDir,
     jsonOutFormat: "sub2api",
@@ -640,6 +661,13 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     emailnatorBaseUrl: normalizeEmailnatorBaseUrl(raw.emailnatorBaseUrl),
     emailnatorEmailType: normalizeEmailnatorEmailType(raw.emailnatorEmailType),
     requireChatgptAccountId: asBoolean(raw.requireChatgptAccountId, true),
+    externalEmailApiBaseUrl: asString(raw.externalEmailApiBaseUrl),
+    externalEmailApiKey: asString(raw.externalEmailApiKey),
+    externalEmailEnabled: asBoolean(raw.externalEmailEnabled, false),
+    externalEmailAliasEnabled: asBoolean(raw.externalEmailAliasEnabled, false),
+    externalEmailAliasPrefix: asString(raw.externalEmailAliasPrefix, "k12"),
+    externalEmailFissionEnabled: asBoolean(raw.externalEmailFissionEnabled, false),
+    externalEmailFissionCount: asNumber(raw.externalEmailFissionCount, 5, 1, 50),
     tokenOut: asString(raw.tokenOut) || path.join(rootDir, "pool_tokens.txt"),
     jsonOutDir: asString(raw.jsonOutDir) || defaultJsonOutDir,
     jsonOutFormat: normalizeJsonOutFormat(raw.jsonOutFormat),
@@ -705,6 +733,9 @@ function publicConfig(config = appConfig): Record<string, unknown> {
     smsBowerApiKey: "",
     smsBowerApiKeyPresent: Boolean(config.smsBowerApiKey),
     smsBowerApiKeyMasked: maskSecret(config.smsBowerApiKey, 4, 4),
+    externalEmailApiKey: "",
+    externalEmailApiKeyPresent: Boolean(config.externalEmailApiKey),
+    externalEmailApiKeyMasked: maskSecret(config.externalEmailApiKey, 4, 4),
   };
 }
 
@@ -1608,6 +1639,250 @@ async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task
   parent.updatedAt = nowIso();
   appendLog(task, "ok", `母邮箱成功，已创建裂变子任务: ${child.email}，剩余 ${remaining - 1}`);
   appendLog(childTask, "info", `由母邮箱 ${parent.email} 成功后创建，复用 SMSBower activation=${parent.smsBowerMailId}`);
+  await Promise.all([persistTasks(), persistEmails()]);
+  return childTask;
+}
+
+// ─── External Pool (outlookEmailPlus) ───────────────────────────────────────
+
+async function externalPoolRequest(
+  pathname: string,
+  body: Record<string, unknown>,
+): Promise<{ok: boolean; data: unknown; message: string}> {
+  const base = appConfig.externalEmailApiBaseUrl.trim();
+  if (!base) throw new Error("externalEmailApiBaseUrl 未配置");
+  const apiKey = appConfig.externalEmailApiKey.trim();
+  if (!apiKey) throw new Error("externalEmailApiKey 未配置");
+
+  const url = new URL(base.replace(/\/+$/, "") + pathname);
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let parsed: Record<string, unknown> = {success: false, message: text};
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // keep raw text as message
+  }
+  return {
+    ok: Boolean(parsed.success),
+    data: parsed.data,
+    message: String(parsed.message || text),
+  };
+}
+
+async function claimExternalPoolAccount(
+  callerId: string,
+  taskId: string,
+  provider = "outlook",
+): Promise<{accountId: number; email: string; claimToken: string; emailDomain: string}> {
+  const result = await externalPoolRequest("/api/external/pool/claim-random", {
+    caller_id: callerId,
+    task_id: taskId,
+    provider,
+  });
+  if (!result.ok || !result.data || typeof result.data !== "object") {
+    throw new Error(`领号失败: ${result.message}`);
+  }
+  const data = result.data as Record<string, unknown>;
+  const accountId = Number(data.account_id);
+  const email = String(data.email || "");
+  const claimToken = String(data.claim_token || "");
+  const emailDomain = String(data.email_domain || "");
+  if (!accountId || !email || !claimToken) {
+    throw new Error(`领号返回数据不完整: ${JSON.stringify(data)}`);
+  }
+  return {accountId, email, claimToken, emailDomain};
+}
+
+async function completeExternalPoolAccount(
+  accountId: number,
+  claimToken: string,
+  callerId: string,
+  taskId: string,
+  result: string,
+  detail = "",
+): Promise<void> {
+  const res = await externalPoolRequest("/api/external/pool/claim-complete", {
+    account_id: accountId,
+    claim_token: claimToken,
+    caller_id: callerId,
+    task_id: taskId,
+    result,
+    detail: detail || undefined,
+  });
+  if (!res.ok) {
+    appendLog({logs: []} as unknown as K12Task, "warn", `claim-complete 失败(${accountId}): ${res.message}`);
+  }
+}
+
+async function releaseExternalPoolAccount(
+  accountId: number,
+  claimToken: string,
+  callerId: string,
+  taskId: string,
+  reason = "",
+): Promise<void> {
+  const body: Record<string, unknown> = {
+    account_id: accountId,
+    claim_token: claimToken,
+    caller_id: callerId,
+    task_id: taskId,
+  };
+  if (reason) body.reason = reason;
+  const res = await externalPoolRequest("/api/external/pool/claim-release", body);
+  if (!res.ok) {
+    appendLog({logs: []} as unknown as K12Task, "warn", `claim-release 失败(${accountId}): ${res.message}`);
+  }
+}
+
+async function fetchExternalPoolVerificationCode(email: string): Promise<string> {
+  const base = appConfig.externalEmailApiBaseUrl.trim();
+  if (!base) throw new Error("externalEmailApiBaseUrl 未配置");
+  const apiKey = appConfig.externalEmailApiKey.trim();
+  if (!apiKey) throw new Error("externalEmailApiKey 未配置");
+
+  const url = new URL(base.replace(/\/+$/, "") + "/api/external/verification-code");
+  url.searchParams.set("email", email);
+  url.searchParams.set("code_length", "6");
+
+  const response = await fetch(url.toString(), {
+    headers: {"x-api-key": apiKey},
+  });
+  const text = await response.text();
+  let parsed: Record<string, unknown> = {success: false};
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // ignore
+  }
+  if (!parsed.success || !parsed.data) {
+    throw new Error(`验证码获取失败: ${String(parsed.message || text)}`);
+  }
+  const data = parsed.data as Record<string, unknown>;
+  const code = String(data.code || data.verification_code || "");
+  if (!code) throw new Error(`验证码为空: ${JSON.stringify(data)}`);
+  return code;
+}
+
+async function waitForExternalPoolCode(
+  email: EmailRecord,
+  task: K12Task,
+  label: string,
+): Promise<string> {
+  const usedCodes = new Set<string>();
+  const maxAttempts = 40;
+  const intervalMs = 5000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (task.cancelRequested) {
+      throw new Error("任务已取消");
+    }
+    try {
+      const code = await fetchExternalPoolVerificationCode(email.email);
+      if (!usedCodes.has(code)) {
+        appendLog(task, "ok", `外部池 ${label} 验证码已获取: ${maskOtpCode(code)}`);
+        return code;
+      }
+      appendLog(task, "info", `外部池 ${label} 验证码已使用过，继续等待新验证码 (${attempt}/${maxAttempts})`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      appendLog(task, "info", `外部池 ${label} 验证码暂未收到，继续等待 (${attempt}/${maxAttempts}): ${msg}`);
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`外部池邮箱中未找到验证码: ${email.email}`);
+}
+
+async function finalizeExternalPoolAccount(email: EmailRecord, task: K12Task): Promise<void> {
+  if (
+    email.otpMode !== "external-pool" ||
+    email.externalPoolAccountId == null ||
+    !email.externalPoolClaimToken
+  ) {
+    return;
+  }
+  const result = task.status === "success" ? "success" : task.cancelRequested ? "verification_timeout" : "network_error";
+  const detail = task.error || "";
+  await completeExternalPoolAccount(
+    email.externalPoolAccountId,
+    email.externalPoolClaimToken,
+    email.externalPoolCallerId || "k12-automation",
+    email.externalPoolTaskId || task.id,
+    result,
+    detail,
+  );
+}
+
+function createExternalPoolFissionChild(mother: EmailRecord, index: number): EmailRecord {
+  const existing = new Set(emails.map((item) => item.email.toLowerCase()));
+  const prefix = appConfig.externalEmailAliasPrefix || "k12";
+  const timestamp = Date.now().toString(36);
+  const aliasSuffix = `+${prefix}-${timestamp}-${index}`;
+  const [localPart, domain] = mother.email.split("@");
+  const childAddress = `${localPart}${aliasSuffix}@${domain}`;
+
+  let uniqueAddress = childAddress;
+  let counter = 0;
+  while (existing.has(uniqueAddress.toLowerCase()) && counter < 50) {
+    counter += 1;
+    uniqueAddress = `${localPart}+${prefix}-${timestamp}-${index}-${counter}@${domain}`;
+  }
+
+  const record: EmailRecord = {
+    id: stableId(uniqueAddress),
+    email: uniqueAddress,
+    parentEmail: mother.email,
+    otpMode: "external-pool",
+    password: "",
+    mailboxUrl: "",
+    raw: `external-pool:${mother.externalPoolAccountId}:${mother.externalPoolClaimToken}:fission`,
+    status: "free",
+    importedAt: nowIso(),
+    updatedAt: nowIso(),
+    externalPoolAccountId: mother.externalPoolAccountId,
+    externalPoolClaimToken: mother.externalPoolClaimToken,
+    externalPoolCallerId: mother.externalPoolCallerId,
+    externalPoolTaskId: mother.externalPoolTaskId,
+    externalPoolProvider: mother.externalPoolProvider,
+    externalPoolFissionParentEmailId: mother.id,
+  };
+  emails.push(record);
+  return record;
+}
+
+async function enqueueNextExternalPoolFissionTask(mother: EmailRecord, task: K12Task): Promise<K12Task | undefined> {
+  if (
+    mother.otpMode !== "external-pool" ||
+    task.status !== "success" ||
+    (mother.externalPoolFissionChildrenRemaining || 0) <= 0
+  ) {
+    return undefined;
+  }
+  const remaining = Math.max(0, mother.externalPoolFissionChildrenRemaining || 0);
+  const child = createExternalPoolFissionChild(mother, remaining - 1);
+  const childTask = enqueueK12Task(child, {
+    route: task.route,
+    workspaceIds: task.workspaceIds,
+    workspaceBatchId: task.workspaceBatchId,
+    workspaceBatchIndex: task.workspaceBatchIndex,
+    workspaceBatchTotal: task.workspaceBatchTotal,
+    runWorkspaceJoin: task.runWorkspaceJoin,
+    runSub2Api: task.runSub2Api,
+    sub2apiNoRtMode: task.sub2apiNoRtMode === true,
+    sub2apiGroupName: task.sub2apiGroupName,
+    fissionRemainingAfterThis: remaining - 1,
+  });
+  mother.externalPoolFissionChildrenRemaining = remaining - 1;
+  mother.updatedAt = nowIso();
+  appendLog(task, "ok", `母邮箱成功，已创建裂变子任务: ${child.email}，剩余 ${remaining - 1}`);
+  appendLog(childTask, "info", `由母邮箱 ${mother.email} 成功后创建，共用外部池账号`);
   await Promise.all([persistTasks(), persistEmails()]);
   return childTask;
 }
@@ -5402,6 +5677,9 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
   } else if (email.otpMode === "emailnator") {
     appendLog(task, "info", `当前邮箱为 Emailnator Gmail 动态接码模式: ${email.email}`);
     fetchOtp = (label: string) => waitForEmailnatorCode(email, task, label);
+  } else if (email.otpMode === "external-pool") {
+    appendLog(task, "info", `当前邮箱为外部邮箱池模式: ${email.email}`);
+    fetchOtp = (label: string) => waitForExternalPoolCode(email, task, label);
   } else {
     const mailboxProvider = new MailboxUrlCodeProvider(email.mailboxUrl);
     let baselineError = "";
@@ -5918,7 +6196,20 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
   if (!task.runWorkspaceJoin) return accessToken;
   let latestToken = accessToken;
   for (const workspaceId of targetK12WorkspaceIds(task)) {
-    latestToken = await runK12WorkspaceJoinForWorkspace(client, task, email, accessToken, workspaceId);
+    try {
+      latestToken = await runK12WorkspaceJoinForWorkspace(client, task, email, accessToken, workspaceId);
+    } catch (error) {
+      const message = normalizeFlowError(error);
+      appendLog(task, "warn", `K12 空间 ${workspaceId.slice(0, 8)}... 加入失败，跳过继续下一个: ${message.slice(0, 200)}`);
+      task.workspaceResults.push({
+        workspaceId,
+        route: task.route,
+        ok: false,
+        status: 0,
+        body: message.slice(0, 500),
+        attempt: 0,
+      });
+    }
   }
   return latestToken;
 }
@@ -5940,7 +6231,20 @@ async function runNoRtWorkspaceBatchTwoPhase(
     assertNotCanceled(task);
     const workspaceId = workspaceIds[workspaceIndex];
     appendLog(task, "info", `K12 申请阶段: ${workspaceIndex + 1}/${workspaceIds.length} ${workspaceId}`);
-    await runK12WorkspaceInviteForWorkspace(client, task, baseAccessToken, workspaceId, {logExisting: true, email});
+    try {
+      await runK12WorkspaceInviteForWorkspace(client, task, baseAccessToken, workspaceId, {logExisting: true, email});
+    } catch (error) {
+      const message = normalizeFlowError(error);
+      appendLog(task, "warn", `K12 noRT 申请 ${workspaceId.slice(0, 8)}... 失败，跳过: ${message.slice(0, 200)}`);
+      task.workspaceResults.push({
+        workspaceId,
+        route: task.route,
+        ok: false,
+        status: 0,
+        body: message.slice(0, 500),
+        attempt: 0,
+      });
+    }
   }
   appendLog(task, "ok", `K12 申请阶段完成: ${workspaceIds.length}/${workspaceIds.length}`);
 
@@ -5962,10 +6266,23 @@ async function runNoRtWorkspaceBatchTwoPhase(
     }
 
     appendLog(task, "info", `K12 导出阶段: ${workspaceIndex + 1}/${workspaceIds.length} ${workspaceId}`);
-    const workspaceToken = await runK12WorkspaceSwitchAndRecordForWorkspace(client, task, email, baseAccessToken, workspaceId);
-    await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort");
-    latestToken = workspaceToken;
-    exportedCount += 1;
+    try {
+      const workspaceToken = await runK12WorkspaceSwitchAndRecordForWorkspace(client, task, email, baseAccessToken, workspaceId);
+      await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort");
+      latestToken = workspaceToken;
+      exportedCount += 1;
+    } catch (error) {
+      const message = normalizeFlowError(error);
+      appendLog(task, "warn", `K12 noRT 导出 ${workspaceId.slice(0, 8)}... 失败，跳过: ${message.slice(0, 200)}`);
+      task.workspaceResults.push({
+        workspaceId,
+        route: task.route,
+        ok: false,
+        status: 0,
+        body: message.slice(0, 500),
+        attempt: 0,
+      });
+    }
   }
   appendLog(task, "ok", `K12 导出阶段完成: 新导出 ${exportedCount} 个，跳过 ${skippedCount} 个`);
   return latestToken;
@@ -6076,9 +6393,22 @@ async function runTask(task: K12Task): Promise<void> {
             assertNotCanceled(task);
             const workspaceId = workspaceIds[workspaceIndex];
             appendLog(task, "info", `开始 workspace ${workspaceIndex + 1}/${workspaceIds.length}: ${workspaceId}`);
-            const workspaceToken = await runK12WorkspaceJoinForWorkspace(client, task, email, baseAccessToken, workspaceId);
-            await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort");
-            accessToken = workspaceToken;
+            try {
+              const workspaceToken = await runK12WorkspaceJoinForWorkspace(client, task, email, baseAccessToken, workspaceId);
+              await upsertAndExportNoRtWorkspaceToken(task, email, workspaceToken, "gpt-k12-nort");
+              accessToken = workspaceToken;
+            } catch (error) {
+              const message = normalizeFlowError(error);
+              appendLog(task, "warn", `K12 noRT 单空间 ${workspaceId.slice(0, 8)}... 加入失败，跳过: ${message.slice(0, 200)}`);
+              task.workspaceResults.push({
+                workspaceId,
+                route: task.route,
+                ok: false,
+                status: 0,
+                body: message.slice(0, 500),
+                attempt: 0,
+              });
+            }
           }
         } else {
           appendLog(task, "info", "Sub2API noRT 模式已开启：跳过 OAuth，用当前 AT 入库");
@@ -6211,8 +6541,14 @@ async function runTask(task: K12Task): Promise<void> {
     await enqueueNextSmsBowerFissionTask(email, task).catch((error) => {
       appendLog(task, "warn", `SMSBower Gmail 裂变子任务创建失败: ${error instanceof Error ? error.message : String(error)}`);
     });
+    await enqueueNextExternalPoolFissionTask(email, task).catch((error) => {
+      appendLog(task, "warn", `外部池裂变子任务创建失败: ${error instanceof Error ? error.message : String(error)}`);
+    });
     await finalizeSmsBowerMailIfDone(email).catch((error) => {
       appendLog(task, "warn", `SMSBower 邮箱释放失败: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    await finalizeExternalPoolAccount(email, task).catch((error) => {
+      appendLog(task, "warn", `外部池账号回写失败: ${error instanceof Error ? error.message : String(error)}`);
     });
     scheduleTasks();
   }
@@ -6500,12 +6836,62 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
   const existingIds = new Set(emails.map((item) => item.id));
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
   const dynamicGmailMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
+  const externalPoolMode = !requestedEmailIds.length && appConfig.externalEmailEnabled;
   let selectedEmails = requestedEmailIds.length
     ? emails.filter((item) => requested.has(item.id))
     : emails.filter((item) => item.status === "free");
-  const defaultLimit = dynamicGmailMode ? 1 : selectedEmails.length || 1;
+  const defaultLimit = dynamicGmailMode || externalPoolMode ? 1 : selectedEmails.length || 1;
   const limit = asNumber(body.count, defaultLimit, 1, 500);
-  if (dynamicGmailMode) {
+  if (externalPoolMode) {
+    const poolProvider = asString(body.externalPoolProvider, "outlook") || "outlook";
+    const callerId = "k12-automation";
+    const fissionEnabled = appConfig.externalEmailFissionEnabled;
+    const fissionCount = appConfig.externalEmailFissionCount;
+    const claimed: EmailRecord[] = [];
+
+    // Claim mother account(s)
+    const motherCount = fissionEnabled ? Math.min(limit, 1) : limit;
+    for (let i = 0; i < motherCount; i += 1) {
+      try {
+        const {accountId, email: poolEmail, claimToken, emailDomain} = await claimExternalPoolAccount(
+          callerId,
+          `task-${Date.now()}-${i}`,
+          poolProvider,
+        );
+        const mother: EmailRecord = {
+          id: stableId(poolEmail),
+          email: poolEmail,
+          otpMode: "external-pool",
+          password: "",
+          mailboxUrl: "",
+          raw: `external-pool:${accountId}:${claimToken}`,
+          status: "free",
+          importedAt: nowIso(),
+          updatedAt: nowIso(),
+          externalPoolAccountId: accountId,
+          externalPoolClaimToken: claimToken,
+          externalPoolCallerId: callerId,
+          externalPoolTaskId: `task-${Date.now()}-${i}`,
+          externalPoolProvider: poolProvider,
+          externalPoolFissionChildrenRemaining: fissionEnabled ? fissionCount : 0,
+        };
+        emails.push(mother);
+        claimed.push(mother);
+
+        // Create fission children
+        if (fissionEnabled) {
+          for (let c = 0; c < fissionCount; c += 1) {
+            const child = createExternalPoolFissionChild(mother, c);
+            claimed.push(child);
+          }
+        }
+      } catch (error) {
+        appendLog({logs: []} as unknown as K12Task, "warn", `外部池领号失败 (${i + 1}/${motherCount}): ${error instanceof Error ? error.message : String(error)}`);
+        if (i === 0) throw new Error("外部邮箱池领号失败，无可用账号");
+      }
+    }
+    selectedEmails = claimed;
+  } else if (dynamicGmailMode) {
     selectedEmails = appConfig.gmailMailProvider === "emailnator"
       ? await createEmailnatorMailRecords(limit)
       : await createSmsBowerMailRecords(limit);
@@ -6914,6 +7300,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       defaultPassword: asString(body.defaultPassword) || appConfig.defaultPassword,
       sub2apiPassword: asString(body.sub2apiPassword) || appConfig.sub2apiPassword,
       smsBowerApiKey: asString(body.smsBowerApiKey) || appConfig.smsBowerApiKey,
+      externalEmailApiKey: asString(body.externalEmailApiKey) || appConfig.externalEmailApiKey,
     };
     if (body.openaiProxyUrls === undefined && body.defaultProxyUrl !== undefined) {
       nextRaw.openaiProxyUrls = [asString(body.defaultProxyUrl)];
